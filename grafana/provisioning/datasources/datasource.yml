@@ -1,0 +1,87 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # This is the metrics-side half of Bridge #2 (see
+      # expense-backend-v1.2/src/metrics.js): the backend already attaches a
+      # real trace_id as an exemplar on every http_request_duration_seconds
+      # observation, and Prometheus already stores it (see
+      # ../../prometheus/prometheus.yml's --enable-feature=exemplar-storage).
+      # This is the piece that was still missing — telling Grafana which
+      # datasource a trace_id exemplar actually points to, so the little
+      # diamond marks on the p50/p95/p99 panels become clickable jumps into
+      # Tempo instead of inert dots.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      # Trace -> logs, the direction opposite the Loki derivedField below.
+      #
+      # tags: [] is required, not just harmless — confirmed live: with this
+      # key left out entirely, Grafana's "Logs for this span" button quietly
+      # defaults to matching the span's own `service.name` resource
+      # attribute against a Loki label called `service_name`, building
+      # `{service_name="expense-backend"}`. That label exists in Loki (3.x
+      # auto-assigns it per stream), but its value there is the *container*
+      # name (`backend`), not the OTel service name (`expense-backend`) —
+      # so the query runs, matches nothing, and looks exactly like "no
+      # logs" even though they're sitting right there. tags: [] turns that
+      # default matching off; filterByTraceID below is the only filter that
+      # actually needs to work, and it doesn't depend on any label lining
+      # up. Also why we don't label Loki lines by trace_id ourselves to
+      # dodge this: a label needs low, bounded cardinality, and a fresh
+      # value on every single request is the textbook way to make Loki's
+      # index fall over. filterByTraceID instead runs a plain
+      # `|="<traceID>"` text search — slower per query than a label lookup,
+      # correct at any trace volume.
+      tracesToLogsV2:
+        datasourceUid: loki
+        tags: []
+        filterByTraceID: true
+        filterBySpanID: false
+        # Confirmed live, and the actual reason "Logs for this span" kept
+        # coming up empty even after the two fixes above: with no shift
+        # configured, the search window defaults to the span's own
+        # start/end timestamp — a handful of milliseconds wide. A log
+        # line's timestamp in Loki is when Alloy read it off the Docker
+        # socket, not the app's in-process clock at the moment it logged —
+        # normal ingestion lag routinely pushes it outside a window that
+        # narrow, even though the line and the trace match perfectly. Wide
+        # enough to absorb that lag without pulling in unrelated requests.
+        spanStartTimeShift: '-5m'
+        spanEndTimeShift: '5m'
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      # Logs -> trace, completing Bridge #1 (see requestLogger.js's own
+      # comment: trace_id/span_id were already being injected into every log
+      # line by @opentelemetry/instrumentation-pino before this stage
+      # existed — Loki and this regex are what finally give that field
+      # somewhere to go). Matches either log source verbatim: the backend's
+      # pino JSON and the frontend's nginx json_combined format both key it
+      # "trace_id", by design (see expense-frontend-v1.2/nginx.conf).
+      derivedFields:
+        - name: trace_id
+          matcherRegex: '"trace_id":"([0-9a-f]+)"'
+          url: '$${__value.raw}'
+          datasourceUid: tempo
+          urlDisplayLabel: View Trace

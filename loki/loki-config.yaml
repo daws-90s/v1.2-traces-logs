@@ -1,0 +1,45 @@
+# Trimmed down from Loki's own official single-binary example
+# (cmd/loki/loki-local-config.yaml in grafana/loki) — dropped `ruler` and
+# `pattern_ingester` (log-based alerting and pattern mining, neither used by
+# this stage) to keep only what filesystem storage + ingestion actually
+# needs. Confirmed against that upstream file, not guessed — Loki 3.x's
+# schema_config shape (store: tsdb, schema: v13) is a real breaking change
+# from 2.x, same class of thing that broke tempo.yaml on the traces stage.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
+
+# /loki isn't backed by a named volume in docker-compose.yml, matching
+# tempo's and prometheus's own choice — a fresh `docker compose up
+# --force-recreate loki` gives every class a clean log history to start from.

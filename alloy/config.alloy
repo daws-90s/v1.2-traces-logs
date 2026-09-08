@@ -1,0 +1,77 @@
+// Three components, each one job: find containers, ship their stdout,
+// write it to Loki. Confirmed against Grafana's own Alloy component
+// reference (discovery.docker, discovery.relabel, loki.source.docker,
+// loki.write) rather than guessed — Alloy's config language (River) has its
+// own syntax, not YAML, and its own breaking changes across versions like
+// everything else in this stack.
+
+// Docker's own container list, refreshed every 5s. Talks to the same
+// docker.sock this compose file mounts read-only into this container.
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "5s"
+}
+
+// discovery.docker's own labels are all __meta_docker_*-prefixed and
+// dropped before reaching a receiver — relabel the ones worth keeping into
+// plain names (and, for two containers, override one Loki would otherwise
+// set on its own — see below) so they show up as real Loki labels once
+// ingested.
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "compose_service"
+  }
+
+  // Trace-to-logs correlation always keys off a label called `service_name`
+  // — confirmed live: it's not something the Tempo datasource's `tags:`
+  // config can add to or turn off, unlike every other tag. Left alone,
+  // Loki 3.x auto-derives that label itself from `container` when nothing
+  // else sets it — giving "backend"/"frontend" — but the span's own
+  // `service.name` resource attribute (tracing.js/nginx.conf) is
+  // "expense-backend"/"expense-frontend". Two different strings for the
+  // same service meant the correlation button's query
+  // (`{service_name="expense-backend"}`) matched zero streams even though
+  // the log lines were sitting right there under `service_name="backend"`.
+  // These two rules override Loki's default so the label actually says
+  // what the trace expects to find.
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/backend"
+    target_label  = "service_name"
+    replacement   = "expense-backend"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/frontend"
+    target_label  = "service_name"
+    replacement   = "expense-frontend"
+  }
+}
+
+// Tails each relabeled container's stdout/stderr and forwards every line,
+// unparsed, to loki.write below — the JSON structure the backend (pino) and
+// frontend (nginx's json_combined format) already emit stays as the log
+// line's raw text. Parsing that JSON into labels/fields happens at query
+// time in Grafana (`| json`), not here, so this component doesn't need to
+// know anything about either log format.
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
