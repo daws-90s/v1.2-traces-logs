@@ -44,6 +44,9 @@ something a human gets paged about or looks at in Grafana.
 |---|---|
 | **grafana** | The one UI over all three stores — Prometheus, Tempo, and Loki are each wired in as a datasource. Dashboards are provisioned from `grafana/dashboards/*.json` on startup, not clicked together by hand. Also where the metrics↔traces↔logs correlation actually shows up: an exemplar on a latency panel jumps into Tempo, a trace's span jumps into its logs, a log line's `trace_id` jumps back into Tempo. |
 
+### Exemplars
+Exemplars are individual trace references attached to specific data points in a Prometheus histogram or counter metric. Instead of just recording "500ms took X requests," an exemplar tags that observation with a trace_id, so from a spike on a latency graph in Grafana you can click through directly to the one specific trace that produced it.
+
 ## The shape underneath all of it
 
 Every exporter/collector pattern above is the same idea repeated: **something that doesn't speak Prometheus/OTLP/Loki's push API natively gets a small process in front of it that translates.** mysqld-exporter and nginx-exporter do this for metrics; the OTel Collector does it for traces (a buffering/fan-out point, not just a translator); Alloy does it for logs. Once that pattern is visible once, the other two are the same shape, not three separate things to memorize.
