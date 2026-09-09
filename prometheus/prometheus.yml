@@ -108,3 +108,12 @@ scrape_configs:
       - targets: ['alloy:12345']
         labels:
           tier: logging
+
+  # rca-agent's own self-metrics (rca-agent/app/metrics.py) — same
+  # self-monitoring pattern as every other job above, so InstanceDown
+  # already covers the agent going down too.
+  - job_name: 'rca-agent'
+    static_configs:
+      - targets: ['rca-agent:8080']
+        labels:
+          tier: agent

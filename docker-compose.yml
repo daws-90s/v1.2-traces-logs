@@ -292,8 +292,54 @@ services:
       - tempo
       - loki
 
+  # --- RCA agent: investigation-only (agent-spec.md). Receives firing/
+  # resolved alerts from alertmanager's own webhook_configs entry
+  # (./alertmanager/alertmanager.yml), investigates read-only across
+  # Prometheus/Loki/Tempo/MySQL/Docker/GitHub, and posts the result to
+  # Slack via a bot token (rca-agent/.env — see rca-agent/README.md).
+  # Never given write access to anything except that one Slack channel;
+  # see rca-agent/app/security/permissions.py for how that's enforced
+  # technically, not just by convention.
+  rca-agent:
+    build:
+      context: ./rca-agent
+    container_name: rca-agent
+    env_file:
+      - ./rca-agent/.env
+    environment:
+      PROMETHEUS_URL: http://prometheus:9090
+      ALERTMANAGER_URL: http://alertmanager:9093
+      LOKI_URL: http://loki:3100
+      TEMPO_URL: http://tempo:3200
+      GRAFANA_URL: http://grafana:3000
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: expense_tracker
+    volumes:
+      # Read-only, same as alloy above — this client only ever lists/
+      # inspects containers (app/docker/readonly_client.py), never
+      # exec/restart/stop.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - rca_agent_data:/data
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+
 volumes:
   expense_mysql_data:
+  # Incident history (app/state/store.py's SQLite file) — unlike tempo/
+  # loki/prometheus's data above, this one *is* a named volume: incident
+  # records are small, and losing them on every recreate would break the
+  # RESOLVED-lookup flow across a routine `docker compose up`.
+  rca_agent_data:
 
 networks:
   default:

@@ -1,9 +1,10 @@
 # What's in this stack
 
 Every service in `docker-compose.yml`, grouped by what it's actually for.
-14 containers, four jobs: run the app, collect the three signals
-(metrics/traces/logs), store each signal, and turn all of it into
-something a human gets paged about or looks at in Grafana.
+15 containers, five jobs: run the app, collect the three signals
+(metrics/traces/logs), store each signal, turn all of it into something a
+human gets paged about or looks at in Grafana — and, new in this stage,
+investigate what a page actually meant before a human even opens it.
 
 ## The app itself
 
@@ -43,6 +44,12 @@ something a human gets paged about or looks at in Grafana.
 | Service | What it is |
 |---|---|
 | **grafana** | The one UI over all three stores — Prometheus, Tempo, and Loki are each wired in as a datasource. Dashboards are provisioned from `grafana/dashboards/*.json` on startup, not clicked together by hand. Also where the metrics↔traces↔logs correlation actually shows up: an exemplar on a latency panel jumps into Tempo, a trace's span jumps into its logs, a log line's `trace_id` jumps back into Tempo. |
+
+## Investigation
+
+| Service | What it is |
+|---|---|
+| **rca-agent** | A Python/FastAPI service (`./rca-agent`) that receives firing/resolved alerts straight from `alertmanager`'s own `webhook_configs` (alongside its existing email + Slack destinations), investigates read-only across Prometheus/Loki/Tempo/MySQL/Docker/GitHub, and posts a hypothesis-driven RCA to Slack via a bot token. Built to [`agent-spec.md`](agent-spec.md); see `rca-agent/README.md` for setup and its own architecture diagram. Investigation-only — no code path in it can restart a container, change config, or write to the database. |
 
 ### Exemplars
 Exemplars are individual trace references attached to specific data points in a Prometheus histogram or counter metric. Instead of just recording "500ms took X requests," an exemplar tags that observation with a trace_id, so from a spike on a latency graph in Grafana you can click through directly to the one specific trace that produced it.

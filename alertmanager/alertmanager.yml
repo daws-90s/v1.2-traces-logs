@@ -27,3 +27,13 @@ receivers:
       - channel: '#grafana-alerts-2'
         api_url_file: /etc/alertmanager/secrets/slack_webhook_url
         send_resolved: true
+    # RCA agent (../rca-agent): a plain HTTP webhook, not another Slack
+    # destination — this is what feeds agent-spec.md's alert-detection
+    # flow. Same receiver as the two above so a single alert triggers all
+    # three (email, human Slack notice, and the agent's own investigation)
+    # from one route. send_resolved is required here specifically: the
+    # agent's incident lifecycle (rca-agent/app/state/store.py) needs the
+    # resolved event to close out an incident, not just the firing one.
+    webhook_configs:
+      - url: 'http://rca-agent:8080/webhook/alertmanager'
+        send_resolved: true

@@ -144,3 +144,14 @@ No log-based alerting (Loki's `ruler` component isn't configured) and no
 dedicated logs dashboard panel — Explore is the right tool while you're
 still learning LogQL and TraceQL by hand. Both are reasonable next steps
 once this stage's mechanics are familiar, not missing by oversight.
+
+## RCA agent
+
+`alertmanager.yml`'s `webhook_configs` entry also forwards every firing/
+resolved alert to `rca-agent`, an investigation-only Python service that
+correlates the three signals above (plus MySQL, Docker, and the app's
+GitHub source) into a hypothesis-driven root-cause analysis, posted to a
+Slack thread. See [`rca-agent/README.md`](rca-agent/README.md) for setup
+— it needs its own Slack bot token and an Anthropic API key, neither of
+which this stage's `docker compose up` provides by default — and
+[`agent-spec.md`](agent-spec.md) for the full design it's built against.
