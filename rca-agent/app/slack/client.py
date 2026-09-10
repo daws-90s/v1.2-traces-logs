@@ -72,6 +72,16 @@ class SlackClient:
         data = self._post_message(text)
         return data["ts"]
 
+    def post_standalone(self, text: str) -> str:
+        """Fallback for when there's no thread to post into — e.g. the
+        investigation-started message itself failed (bot not invited to
+        the channel, transient API error) but the investigation still
+        completed. Posts as a new top-level message instead of silently
+        dropping the RCA, and returns its ts so later replies can still
+        thread under it."""
+        data = self._post_message(text)
+        return data["ts"]
+
     def send_update(self, incident_id: str, thread_ts: str, text: str, min_interval_seconds: int = 60) -> None:
         """Throttled per #46 — callers may propose an update after every
         playbook step, but this drops one silently if the last update for

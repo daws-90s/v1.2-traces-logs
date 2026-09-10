@@ -162,7 +162,20 @@ def _run_investigation(incident_id: str, alert: AlertmanagerAlert) -> None:
             _slack.send_detailed_rca(incident.slack_thread_ts, report_text)
             metrics.slack_messages_total.labels(kind="rca").inc()
         except SlackUnavailableError as exc:
-            logger.error("could not post RCA to Slack: %s", exc)
+            logger.error("could not post RCA to Slack thread for incident %s: %s", incident_id, exc)
+    elif _slack.configured:
+        # Slack is configured but there's no thread to post into — almost
+        # always because the investigation-started message itself failed
+        # (bot not yet invited to the channel, transient API error). Post
+        # the RCA as a new top-level message instead of dropping it.
+        logger.warning("incident %s has no Slack thread (initial post likely failed) — posting RCA as a standalone message", incident_id)
+        try:
+            new_ts = _slack.post_standalone(summary_text)
+            incident.slack_thread_ts = new_ts
+            _slack.send_detailed_rca(new_ts, report_text)
+            metrics.slack_messages_total.labels(kind="rca").inc()
+        except SlackUnavailableError as exc:
+            logger.error("could not post RCA to Slack for incident %s even as a standalone message: %s", incident_id, exc)
     else:
         logger.warning("Slack not configured — RCA for incident %s was computed but not posted:\n%s", incident_id, summary_text)
 
@@ -179,7 +192,7 @@ def _report_timeout(incident, alert: AlertmanagerAlert, reason: str | None = Non
     incident.status = "INSUFFICIENT_EVIDENCE"
     incident.investigation_state = "TIMED_OUT"
     store.save(incident)
-    if not incident.slack_thread_ts:
+    if not _slack.configured:
         return
     text = (
         "⚠️ RCA Investigation Incomplete\n\n"
@@ -189,9 +202,13 @@ def _report_timeout(incident, alert: AlertmanagerAlert, reason: str | None = Non
         "Additional investigation required."
     )
     try:
-        _slack.send_rca_summary(incident.slack_thread_ts, text)
+        if incident.slack_thread_ts:
+            _slack.send_rca_summary(incident.slack_thread_ts, text)
+        else:
+            incident.slack_thread_ts = _slack.post_standalone(text)
+            store.save(incident)
     except SlackUnavailableError as exc:
-        logger.error("could not post timeout notice to Slack: %s", exc)
+        logger.error("could not post timeout notice to Slack for incident %s: %s", incident.incident_id, exc)
 
 
 def _parse_iso_to_epoch(iso_str: str) -> int:
