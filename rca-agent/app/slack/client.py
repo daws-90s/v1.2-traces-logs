@@ -15,6 +15,7 @@ import time
 import httpx
 
 from app.config import settings
+from app.slack.formatting import markdown_to_mrkdwn
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +101,13 @@ class SlackClient:
     def send_detailed_rca(self, thread_ts: str, report_markdown: str) -> None:
         """Slack messages have a practical length limit; a long detailed
         report is split into a small number of threaded replies rather than
-        truncated silently."""
+        truncated silently. report_markdown is plain Markdown (from
+        app/rca/report.py) — converted to Slack's mrkdwn dialect here, at
+        the point of sending, so `#`/`##` headings and `**bold**` actually
+        render instead of showing up as literal characters."""
+        mrkdwn = markdown_to_mrkdwn(report_markdown)
         chunk_size = 3500
-        chunks = [report_markdown[i : i + chunk_size] for i in range(0, len(report_markdown), chunk_size)] or [""]
+        chunks = [mrkdwn[i : i + chunk_size] for i in range(0, len(mrkdwn), chunk_size)] or [""]
         for i, chunk in enumerate(chunks):
             prefix = "📄 Detailed RCA Report\n\n" if i == 0 else ""
             self._post_message(prefix + chunk, thread_ts=thread_ts)

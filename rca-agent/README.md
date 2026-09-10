@@ -105,6 +105,80 @@ To stop MySQL outright for the `MySQLDown` playbook: `docker compose stop
 mysql`, then `docker compose start mysql` once you've seen the
 investigation (and its `resolved` follow-up) come through.
 
+## Manual trigger (`POST /investigate`)
+
+The agent normally only starts an investigation when Alertmanager posts to
+`/webhook/alertmanager` — which means actually breaching a real threshold
+first. `/investigate` runs the exact same pipeline on demand, with alert
+labels you supply, so you can demo a specific playbook without waiting for
+(or faking) a real incident:
+
+```bash
+# MySQLDown playbook
+curl -s -X POST http://localhost:8080/investigate \
+  -H 'Content-Type: application/json' \
+  -d '{"alert_name": "MySQLDown", "labels": {"severity": "critical"}}'
+
+# HighAPIp99Latency playbook, scoped to one route
+curl -s -X POST http://localhost:8080/investigate \
+  -H 'Content-Type: application/json' \
+  -d '{"alert_name": "HighAPIp99Latency", "labels": {"route": "/expenses", "severity": "warning"}}'
+
+# HTTP500High playbook
+curl -s -X POST http://localhost:8080/investigate \
+  -H 'Content-Type: application/json' \
+  -d '{"alert_name": "HTTP500High", "labels": {"severity": "warning"}}'
+```
+
+Each call returns immediately with an `incident_id` and `fingerprint` —
+the investigation itself runs in the background; watch Slack (or `docker
+compose logs -f rca-agent`) for the result. Calling it again with the same
+`fingerprint` exercises dedup (#30) instead of starting a second
+investigation for what's still the same incident. To see the `resolved`
+Slack message (#31), call it again with that same fingerprint and
+`"status": "resolved"`.
+
+Any `alert_name` works — one of the three playbooks
+(`MySQLDown`/`HighAPIp99Latency`/`BackendLatencyP95High`/`HTTP500High`/
+`Backend5xxRateHigh`) if it matches, `DefaultPlaybook` otherwise, same as
+a real unrecognized Alertmanager alertname would get.
+
+This endpoint has no auth by default — fine on `localhost`/the Docker
+network, not fine if port 8080 ends up reachable from the internet (it's
+published to the host in `docker-compose.yml`). Set
+`RCA_MANUAL_TRIGGER_TOKEN` in `.env` to require an `X-RCA-Trigger-Token`
+header matching it if your EC2 security group exposes 8080 (this also
+gates `/ask` below).
+
+## Ask a question directly (`POST /ask`)
+
+`/investigate` still needs you to know which playbook/labels to pass.
+`/ask` takes a plain question, picks a playbook by keyword match (deliberately
+not an LLM call — see `app/investigation/ask.py`'s own comment on why),
+and — unlike every other entrypoint — **blocks and returns the answer
+directly in the HTTP response** instead of only posting to Slack:
+
+```bash
+curl -s -X POST http://localhost:8080/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"question": "investigate a recent high latency request and tell me the reason"}' | jq
+```
+
+"latency"/"slow"/"p99"/"timeout" routes to `HighAPIp99Latency` and, since
+no specific route was named, the agent first queries Prometheus for
+whichever route currently has the worst p99 and investigates that one.
+"mysql"/"database down" routes to `MySQLDown`, "500"/"errors"/"failing" to
+`HTTP500High`; anything else falls through to the generic playbook (host/
+container/log sweep). The Slack investigation-started/RCA messages still
+go out as usual if Slack is configured — `/ask` is an additional way to
+get the answer, not a replacement for the Slack flow.
+
+Defaults to a 60s budget (`RCA_ASK_MAX_SECONDS`, capped at
+`RCA_MAX_INVESTIGATION_SECONDS`) since you're waiting on the HTTP
+response — override per-call with `"timeout_seconds": 120` in the request
+body if a slower playbook needs more room. A timeout returns a 200 with
+`"confidence": "Unknown"` and a note to check Slack/logs, not an error.
+
 ## Architecture
 
 ```

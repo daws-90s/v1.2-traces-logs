@@ -75,5 +75,20 @@ class Settings:
         self.log_level = os.environ.get("LOG_LEVEL", "INFO")
         self.port = _int("PORT", 8080)
 
+        # POST /investigate and POST /ask (manual trigger / free-text
+        # question, no real Alertmanager alert needed) are open to
+        # anything that can reach this container's port 8080 when this is
+        # unset — fine on a Docker-internal network, not fine if 8080 is
+        # exposed past the EC2 security group. Set this to require an
+        # X-RCA-Trigger-Token header.
+        self.manual_trigger_token = os.environ.get("RCA_MANUAL_TRIGGER_TOKEN", "")
+
+        # POST /ask blocks the HTTP request until the investigation
+        # finishes (the point is getting an answer back synchronously),
+        # so it gets its own, shorter default budget than the
+        # Slack-only background path's RCA_MAX_INVESTIGATION_SECONDS —
+        # capped at that value regardless of what a caller requests.
+        self.ask_max_investigation_seconds = _int("RCA_ASK_MAX_SECONDS", 60)
+
 
 settings = Settings()

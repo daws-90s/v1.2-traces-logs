@@ -1,18 +1,28 @@
-"""FastAPI entrypoint: POST /webhook/alertmanager (#9), GET /health, /ready
-(#41), GET /metrics (#42, this agent's own self-monitoring). No other
-routes exist — in particular, nothing here accepts arbitrary commands or
-SQL from a caller.
+"""FastAPI entrypoint: POST /webhook/alertmanager (#9), POST /investigate
+(manual trigger — not in the spec, added so an alert doesn't have to
+actually fire in Prometheus to run/demo a playbook), POST /ask (free-text
+question, also not in the spec — "investigate a recent high latency
+request and tell me the reason" — answered synchronously in the HTTP
+response), GET /health, /ready (#41), GET /metrics (#42, this agent's own
+self-monitoring). Every route here only ever starts a read-only
+investigation or reads agent state — none of them accept arbitrary
+commands or SQL from a caller.
 """
 import json
 import logging
+import uuid
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from app import metrics
-from app.alertmanager.models import AlertmanagerWebhookPayload
+from app.alertmanager.models import AlertmanagerAlert, AlertmanagerWebhookPayload
 from app.config import settings
+from app.investigation.ask import handle_ask
 from app.investigation.orchestrator import handle_webhook_alert
+from app.playbooks.registry import get_playbook
 from app.state import store
 
 
@@ -86,3 +96,90 @@ def alertmanager_webhook(payload: AlertmanagerWebhookPayload):
         except Exception:  # noqa: BLE001 — one malformed alert must not break the rest of the group
             logger.exception("failed to handle alert fingerprint=%s", alert.fingerprint)
     return {"received": len(payload.alerts)}
+
+
+class ManualInvestigationRequest(BaseModel):
+    # Matches an existing playbook name in app/playbooks/registry.py
+    # (MySQLDown, HighAPIp99Latency, HTTP500High, ...) to run that
+    # playbook; anything else falls through to DefaultPlaybook, same as a
+    # real, unrecognized Alertmanager alertname would.
+    alert_name: str
+    labels: dict[str, str] = {}
+    annotations: dict[str, str] = {}
+    severity: str = "warning"
+    # Left unset for a fresh incident each call; pass the same value twice
+    # to exercise dedup (#30) against an in-progress investigation instead
+    # — or to "resolve" a manually-triggered incident (status="resolved")
+    # and see the resolution Slack message (#31).
+    fingerprint: str | None = None
+    status: str = "firing"  # "firing" | "resolved"
+
+
+@app.post("/investigate")
+def manual_investigate(req: ManualInvestigationRequest, x_rca_trigger_token: str | None = Header(default=None)):
+    """Runs the investigation pipeline exactly as the real webhook would,
+    without waiting for Prometheus to actually breach a threshold — useful
+    for demoing a specific playbook (MySQLDown, HighAPIp99Latency with a
+    `route` label, HTTP500High, ...) on demand. See rca-agent/README.md
+    for curl examples per playbook."""
+    if settings.manual_trigger_token and x_rca_trigger_token != settings.manual_trigger_token:
+        raise HTTPException(status_code=403, detail="missing or invalid X-RCA-Trigger-Token")
+    if req.status not in ("firing", "resolved"):
+        raise HTTPException(status_code=400, detail='status must be "firing" or "resolved"')
+    if req.status == "resolved" and not req.fingerprint:
+        raise HTTPException(status_code=400, detail="resolving requires the fingerprint returned by the earlier firing call")
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fingerprint = req.fingerprint or f"manual-{uuid.uuid4()}"
+    alert = AlertmanagerAlert(
+        status=req.status,
+        labels={"alertname": req.alert_name, "severity": req.severity, **req.labels},
+        annotations=req.annotations,
+        startsAt=now,
+        endsAt=now if req.status == "resolved" else None,
+        generatorURL=None,
+        fingerprint=fingerprint,
+    )
+    # get_active_by_fingerprint excludes RESOLVED incidents, so for a
+    # resolve call the incident must be looked up *before* handling it
+    # (while it's still active) — right after, it's already RESOLVED.
+    incident_id = None
+    if req.status == "resolved":
+        existing = store.get_active_by_fingerprint(fingerprint)
+        incident_id = existing.incident_id if existing else None
+        handle_webhook_alert(alert)
+    else:
+        handle_webhook_alert(alert)
+        incident = store.get_active_by_fingerprint(fingerprint)
+        incident_id = incident.incident_id if incident else None
+
+    return {
+        "incident_id": incident_id,
+        "fingerprint": fingerprint,
+        "playbook": get_playbook(req.alert_name).name,
+        "note": "investigation runs in the background — watch Slack, or `docker compose logs -f rca-agent`",
+    }
+
+
+class AskRequest(BaseModel):
+    question: str
+    # Overrides settings.ask_max_investigation_seconds; always capped at
+    # settings.max_investigation_seconds regardless of what's requested.
+    timeout_seconds: int | None = None
+
+
+@app.post("/ask")
+def ask(req: AskRequest, x_rca_trigger_token: str | None = Header(default=None)):
+    """Free-text investigation, e.g. {"question": "investigate a recent
+    high latency request and tell me the reason"}. Unlike /investigate,
+    this blocks until the investigation finishes (or times out) and
+    returns the answer directly in the response — no need to go check
+    Slack. See rca-agent/README.md for more examples and how question
+    text gets classified into a playbook."""
+    if settings.manual_trigger_token and x_rca_trigger_token != settings.manual_trigger_token:
+        raise HTTPException(status_code=403, detail="missing or invalid X-RCA-Trigger-Token")
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="question must not be empty")
+
+    timeout_seconds = min(req.timeout_seconds or settings.ask_max_investigation_seconds, settings.max_investigation_seconds)
+    return handle_ask(req.question, timeout_seconds=timeout_seconds)

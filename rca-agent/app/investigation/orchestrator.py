@@ -15,11 +15,12 @@ from app.config import settings
 from app.investigation.context import InvestigationContext, ToolCallBudgetExceeded
 from app.llm.client import LLMClient
 from app.playbooks.registry import get_playbook
-from app.rca.engine import generate_rca
+from app.rca.engine import RCAResult, generate_rca
 from app.rca.report import format_detailed_report
 from app.rca.summary import format_summary
 from app.slack.client import SlackClient, SlackUnavailableError
 from app.state import store
+from app.state.store import Incident
 
 logger = logging.getLogger(__name__)
 
@@ -49,13 +50,23 @@ def _handle_firing(alert: AlertmanagerAlert) -> None:
         logger.info("alert %s (fingerprint=%s) already has an active incident %s — skipping", alert.labels.get("alertname"), alert.fingerprint, existing.incident_id)
         return
 
+    incident = create_incident_and_notify(alert)
+    _dispatch_pool.submit(run_investigation, incident.incident_id, alert)
+
+
+def create_incident_and_notify(alert: AlertmanagerAlert, sources: list[str] | None = None) -> Incident:
+    """Creates the incident row and sends the parent Slack message (#11) —
+    shared by the real webhook path (_handle_firing above) and the
+    synchronous /ask entrypoint (app/investigation/ask.py), so both go
+    through the exact same investigation-started lifecycle step.
+    """
     alert_name = alert.labels.get("alertname", "UnknownAlert")
     incident = store.create(alert.fingerprint, alert_name, alert.labels, alert.startsAt)
     incident.status = "INVESTIGATION_STARTED"
 
     severity = alert.labels.get("severity", "unknown")
     instance = alert.labels.get("instance") or alert.labels.get("job") or "unknown"
-    sources = ["Prometheus metrics", "Loki logs", "Tempo traces", "MySQL diagnostics", "Container health", "Application source code"]
+    sources = sources or ["Prometheus metrics", "Loki logs", "Tempo traces", "MySQL diagnostics", "Container health", "Application source code"]
     try:
         thread_ts = _slack.send_investigation_started(alert_name, severity, instance, alert.startsAt, sources)
         incident.slack_thread_ts = thread_ts
@@ -63,8 +74,7 @@ def _handle_firing(alert: AlertmanagerAlert) -> None:
     except SlackUnavailableError as exc:
         logger.error("could not send investigation-started Slack message: %s", exc)
     store.save(incident)
-
-    _dispatch_pool.submit(_run_investigation, incident.incident_id, alert)
+    return incident
 
 
 def _handle_resolved(alert: AlertmanagerAlert) -> None:
@@ -93,11 +103,20 @@ def _handle_resolved(alert: AlertmanagerAlert) -> None:
             logger.error("could not send resolution Slack message: %s", exc)
 
 
-def _run_investigation(incident_id: str, alert: AlertmanagerAlert) -> None:
+def run_investigation(incident_id: str, alert: AlertmanagerAlert, timeout_seconds: int | None = None) -> RCAResult | None:
+    """The investigation body — playbook -> RCA -> persist -> Slack.
+    Returns the RCAResult, or None on timeout/budget/unhandled failure
+    (already logged and reflected in incident state by the time it
+    returns). Called fire-and-forget on a background thread for a real
+    Alertmanager alert (_handle_firing above); called directly and its
+    return value used for the synchronous /ask endpoint
+    (app/investigation/ask.py) — same pipeline either way.
+    """
+    timeout_seconds = timeout_seconds or settings.max_investigation_seconds
     incident = store.get(incident_id)
     if incident is None:
         logger.error("incident %s vanished before investigation could start", incident_id)
-        return
+        return None
 
     start = time.monotonic()
     metrics.investigations_started_total.inc()
@@ -116,22 +135,22 @@ def _run_investigation(incident_id: str, alert: AlertmanagerAlert) -> None:
 
     try:
         future = _deadline_pool.submit(playbook.run, ctx)
-        bundle, hypotheses = future.result(timeout=settings.max_investigation_seconds)
+        bundle, hypotheses = future.result(timeout=timeout_seconds)
     except FutureTimeoutError:
-        _report_timeout(incident, alert)
+        _report_timeout(incident, alert, timeout_seconds=timeout_seconds)
         metrics.investigations_failed_total.inc()
-        return
+        return None
     except ToolCallBudgetExceeded as exc:
         logger.error("incident %s: %s", incident_id, exc)
-        _report_timeout(incident, alert, reason=str(exc))
+        _report_timeout(incident, alert, timeout_seconds=timeout_seconds, reason=str(exc))
         metrics.investigations_failed_total.inc()
-        return
+        return None
     except Exception:  # noqa: BLE001 — an unhandled playbook error must not crash the process
         logger.exception("incident %s: playbook %s raised", incident_id, playbook.name)
         metrics.investigations_failed_total.inc()
         incident.status = "INVESTIGATION_FAILED"
         store.save(incident)
-        return
+        return None
 
     incident.investigation_state = "HYPOTHESIS_VALIDATION"
     store.save(incident)
@@ -187,8 +206,10 @@ def _run_investigation(incident_id: str, alert: AlertmanagerAlert) -> None:
     metrics.record_confidence(incident.alert_name, result.confidence)
     metrics.investigation_duration_seconds.observe(time.monotonic() - start)
 
+    return result
 
-def _report_timeout(incident, alert: AlertmanagerAlert, reason: str | None = None) -> None:
+
+def _report_timeout(incident, alert: AlertmanagerAlert, timeout_seconds: int | None = None, reason: str | None = None) -> None:
     incident.status = "INSUFFICIENT_EVIDENCE"
     incident.investigation_state = "TIMED_OUT"
     store.save(incident)
@@ -197,7 +218,7 @@ def _report_timeout(incident, alert: AlertmanagerAlert, reason: str | None = Non
     text = (
         "⚠️ RCA Investigation Incomplete\n\n"
         "The agent could not establish a high-confidence root cause within the investigation window "
-        f"({settings.max_investigation_seconds}s).\n\n"
+        f"({timeout_seconds or settings.max_investigation_seconds}s).\n\n"
         f"{('Reason: ' + reason) if reason else ''}\n\n"
         "Additional investigation required."
     )
