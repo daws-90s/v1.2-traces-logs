@@ -17,6 +17,11 @@ def format_detailed_report(
     lines += [f"## Executive Summary\n{result.executive_summary or 'Not available.'}", ""]
     lines += [f"## Impact\n{result.impact or 'Not determined.'}", ""]
 
+    if result.dashboard_url:
+        lines.append("## Relevant Dashboard")
+        lines.append(f"[{result.dashboard_description or 'View in Grafana'}]({result.dashboard_url})")
+        lines.append("")
+
     lines.append("## Timeline")
     if result.timeline:
         for t in result.timeline:

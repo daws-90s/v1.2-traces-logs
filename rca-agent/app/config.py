@@ -30,6 +30,18 @@ class Settings:
         self.tempo_url = os.environ.get("TEMPO_URL", "http://tempo:3200")
         self.grafana_url = os.environ.get("GRAFANA_URL", "http://grafana:3000")
 
+        # --- Grafana dashboard discovery (app/grafana/discovery.py): a
+        # read-only GET /api/search + /api/dashboards/uid/{uid}, using the
+        # same admin credential docker-compose.yml already sets
+        # (GF_SECURITY_ADMIN_PASSWORD) since this stack has no separate
+        # read-only Grafana account. Only used to find a relevant panel to
+        # link to in the RCA — never to create/update a dashboard,
+        # datasource, or alert rule. ---
+        self.grafana_api_user = os.environ.get("GRAFANA_API_USER", "admin")
+        self.grafana_api_password = os.environ.get("GRAFANA_API_PASSWORD", "admin")
+        self.grafana_discovery_enabled = _bool("RCA_GRAFANA_DISCOVERY_ENABLED", True)
+        self.grafana_dashboard_tag = os.environ.get("GRAFANA_DASHBOARD_TAG", "expense-tracker")
+
         # --- MySQL read-only access (see migrations/005_rca_readonly_user.sql
         # in expense-mysql-v1 — same least-privilege pattern as
         # metrics_exporter in 003_metrics_user.sql) ---
@@ -83,12 +95,34 @@ class Settings:
         # X-RCA-Trigger-Token header.
         self.manual_trigger_token = os.environ.get("RCA_MANUAL_TRIGGER_TOKEN", "")
 
+        # Independent of the token above: even a caller who has it (or a
+        # trusted internal service) can't spam an Anthropic-billed
+        # investigation / the Slack channel from one client. Per-caller
+        # sliding window (app/security/ratelimit.py), in-process — fine
+        # for this single-container POC.
+        self.manual_trigger_rate_limit = _int("RCA_MANUAL_TRIGGER_RATE_LIMIT", 10)
+        self.manual_trigger_rate_limit_window_seconds = _int("RCA_MANUAL_TRIGGER_RATE_LIMIT_WINDOW_SECONDS", 60)
+
         # POST /ask blocks the HTTP request until the investigation
         # finishes (the point is getting an answer back synchronously),
         # so it gets its own, shorter default budget than the
         # Slack-only background path's RCA_MAX_INVESTIGATION_SECONDS —
         # capped at that value regardless of what a caller requests.
         self.ask_max_investigation_seconds = _int("RCA_ASK_MAX_SECONDS", 60)
+
+        # --- Auto-remediation (opt-in; off unless both this AND the
+        # backend's own ENABLE_AGENT_REMEDIATION are set). The agent's
+        # only write action beyond Slack: POST to the backend's own
+        # allow-listed /agent-remediation/restart
+        # (expense-backend-v1.2/src/routes/agentRemediation.js), which
+        # enforces its own ALLOWED_CONTAINERS server-side regardless of
+        # what this agent sends. See app/investigation/remediation_policy.py
+        # for the (deterministic, never LLM-driven) decision of whether a
+        # given investigation qualifies. ---
+        self.backend_url = os.environ.get("BACKEND_URL", "http://backend:4000")
+        self.auto_remediation_enabled = _bool("RCA_AUTO_REMEDIATION_ENABLED", False)
+        self.auto_remediation_min_confidence = os.environ.get("RCA_AUTO_REMEDIATION_MIN_CONFIDENCE", "High")
+        self.auto_remediation_cooldown_seconds = _int("RCA_AUTO_REMEDIATION_COOLDOWN_SECONDS", 900)
 
 
 settings = Settings()

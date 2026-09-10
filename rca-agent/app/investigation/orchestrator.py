@@ -12,12 +12,16 @@ from datetime import datetime, timezone
 from app import metrics
 from app.alertmanager.models import AlertmanagerAlert
 from app.config import settings
+from app.grafana.discovery import find_panel_link
 from app.investigation.context import InvestigationContext, ToolCallBudgetExceeded
+from app.investigation.hypotheses import rank
+from app.investigation import remediation_policy
 from app.llm.client import LLMClient
 from app.playbooks.registry import get_playbook
 from app.rca.engine import RCAResult, generate_rca
 from app.rca.report import format_detailed_report
 from app.rca.summary import format_summary
+from app.remediation.client import RemediationError, restart_container
 from app.slack.client import SlackClient, SlackUnavailableError
 from app.state import store
 from app.state.store import Incident
@@ -157,6 +161,10 @@ def run_investigation(incident_id: str, alert: AlertmanagerAlert, timeout_second
 
     result = generate_rca(ctx, bundle, hypotheses, llm=LLMClient())
 
+    panel = find_panel_link(incident.alert_name, from_ms=ctx.baseline_window().start_s * 1000, to_ms=ctx.now_s * 1000)
+    if panel:
+        result.dashboard_url, result.dashboard_description = panel
+
     incident.status = "ROOT_CAUSE_IDENTIFIED" if result.root_cause else "INSUFFICIENT_EVIDENCE"
     incident.investigation_state = "RCA_GENERATED"
     incident.hypotheses = result.hypotheses
@@ -198,6 +206,11 @@ def run_investigation(incident_id: str, alert: AlertmanagerAlert, timeout_second
     else:
         logger.warning("Slack not configured — RCA for incident %s was computed but not posted:\n%s", incident_id, summary_text)
 
+    top_hypothesis = rank(hypotheses)[0] if hypotheses else None
+    container = remediation_policy.decide(incident.alert_name, result, top_hypothesis)
+    if container:
+        _attempt_remediation(incident, container, result)
+
     incident.status = "SLACK_REPORTED" if incident.slack_thread_ts else incident.status
     incident.investigation_state = "WAITING_FOR_RESOLUTION"
     store.save(incident)
@@ -207,6 +220,35 @@ def run_investigation(incident_id: str, alert: AlertmanagerAlert, timeout_second
     metrics.investigation_duration_seconds.observe(time.monotonic() - start)
 
     return result
+
+
+def _attempt_remediation(incident, container: str, result: RCAResult) -> None:
+    """Called only after remediation_policy.decide() has already made the
+    (deterministic, non-LLM) decision to act. Always notifies Slack, on
+    both success and failure, so a restart this agent triggers is never
+    silent."""
+    logger.warning(
+        "incident %s: auto-remediation triggered — restarting %r (confidence=%s, root_cause=%r)",
+        incident.incident_id, container, result.confidence, result.root_cause,
+    )
+    try:
+        restart_container(container)
+        remediation_policy.record_restart(container)
+        metrics.remediation_actions_total.labels(container=container, outcome="success").inc()
+        detail = f"Confidence: {result.confidence}\nTriggered by: {result.root_cause or 'leading hypothesis (see RCA above)'}"
+        success = True
+    except RemediationError as exc:
+        logger.error("incident %s: auto-remediation failed: %s", incident.incident_id, exc)
+        metrics.remediation_actions_total.labels(container=container, outcome="failed").inc()
+        detail = f"Error: {exc}"
+        success = False
+
+    if incident.slack_thread_ts:
+        try:
+            _slack.send_remediation_notice(incident.slack_thread_ts, container, success, detail)
+            metrics.slack_messages_total.labels(kind="remediation").inc()
+        except SlackUnavailableError as exc:
+            logger.error("could not post remediation notice to Slack for incident %s: %s", incident.incident_id, exc)
 
 
 def _report_timeout(incident, alert: AlertmanagerAlert, timeout_seconds: int | None = None, reason: str | None = None) -> None:

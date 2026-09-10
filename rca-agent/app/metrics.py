@@ -33,6 +33,9 @@ rca_confidence = Gauge(
 slack_messages_total = Counter(
     "rca_agent_slack_messages_total", "Slack messages sent", ["kind"], registry=registry
 )
+remediation_actions_total = Counter(
+    "rca_agent_remediation_actions_total", "Auto-remediation actions attempted", ["container", "outcome"], registry=registry
+)
 
 _CONFIDENCE_VALUE = {"Unknown": 0, "Low": 1, "Medium": 2, "High": 3}
 

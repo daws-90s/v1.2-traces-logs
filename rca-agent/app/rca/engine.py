@@ -41,6 +41,11 @@ class RCAResult:
     hypotheses: list[dict] = field(default_factory=list)
     llm_used: bool = False
     insufficient_evidence: bool = False
+    # Filled in by the orchestrator after generate_rca() returns (#20
+    # fast-follow, app/grafana/discovery.py) — not computed here, since
+    # discovery is a Grafana lookup, not evidence reasoning.
+    dashboard_url: str | None = None
+    dashboard_description: str | None = None
 
 
 def generate_rca(

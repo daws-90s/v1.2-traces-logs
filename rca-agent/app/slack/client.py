@@ -4,10 +4,12 @@ alertmanager/secrets/slack_webhook_url uses, because threading (#45) needs
 chat.postMessage's thread_ts, which an incoming webhook has no equivalent
 for.
 
-Every public method here maps to exactly one of the four allowed Slack
-writes in #6: investigation started, investigation update, RCA
-summary/report, resolution. There is no generic "send arbitrary message"
-escape hatch used anywhere else in this codebase.
+Every public method here maps to one of the allowed Slack writes in #6
+(investigation started, investigation update, RCA summary/report,
+resolution) plus one POC addition, send_remediation_notice — reporting
+the outcome of the agent's other write action (app/remediation/client.py).
+There is no generic "send arbitrary message" escape hatch used anywhere
+else in this codebase.
 """
 import logging
 import time
@@ -111,6 +113,18 @@ class SlackClient:
         for i, chunk in enumerate(chunks):
             prefix = "📄 Detailed RCA Report\n\n" if i == 0 else ""
             self._post_message(prefix + chunk, thread_ts=thread_ts)
+
+    def send_remediation_notice(self, thread_ts: str, container: str, success: bool, detail: str) -> None:
+        """Always posted, success or failure — a restart triggered by this
+        agent must never be silent in the incident thread."""
+        header = "🔧 Auto-Remediation" if success else "⚠️ Auto-Remediation Attempt Failed"
+        text = (
+            f"{header}\n\n"
+            f"Action: restart `{container}`\n"
+            f"{detail}\n\n"
+            f"This is a mitigation, not a fix — see the RCA above for the underlying cause."
+        )
+        self._post_message(text, thread_ts=thread_ts)
 
     def send_resolution(self, thread_ts: str, alert_name: str, started_at: str, resolved_at: str, duration_str: str, root_cause: str | None, confidence: str) -> None:
         text = (

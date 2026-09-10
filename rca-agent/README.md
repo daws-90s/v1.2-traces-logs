@@ -7,11 +7,14 @@ root-cause analysis to Slack. Built against
 [`agent-spec.md`](../agent-spec.md) — read that file for the full
 requirements; this README is setup + a map of how the code implements it.
 
-It **never modifies** anything — not the app, not the database, not
-Docker, not Prometheus/Grafana/Alertmanager/Loki/Tempo config. The only
-write operation anywhere in this codebase is posting to Slack. See
-[Security model](#security-model) below for how that's enforced in code,
-not just by convention.
+By default it's investigation-only: it never modifies the app, the
+database, Docker, or any Prometheus/Grafana/Alertmanager/Loki/Tempo
+config, and the only write anywhere in this codebase is posting to Slack.
+One opt-in exception exists for this POC — see
+[Auto-remediation](#auto-remediation-opt-in-poc-only) — a single,
+allow-listed, confidence-gated container restart, off unless explicitly
+enabled. See [Security model](#security-model) below for how all of this
+is enforced in code, not just by convention.
 
 ## What's implemented in this pass
 
@@ -24,9 +27,23 @@ sanitization layer. Three playbooks ship (`MySQLDown`, `HighAPIp99Latency`
 generic fallback for every other alert in this stack's `alert-rules.yml`.
 
 GitHub source-code correlation (#23-24) and Grafana deep-links (#20) are
-wired in — lightweight but functional, not stubs. A fuller Grafana
-dashboard-discovery API and a broader automated test suite are the
-natural fast-follow (spec phases 7-9) and aren't attempted here.
+wired in — lightweight but functional, not stubs.
+
+**Fast-follow, now also implemented:** Grafana dashboard discovery
+(`app/grafana/discovery.py`) — instead of a hardcoded dashboard UID/panel
+ID, it searches Grafana's own API at investigation time and matches a
+panel by the metric its PromQL target references, then attaches that link
+to both the Slack summary and the detailed report. And a broader test
+suite covering prompt-injection end to end (`tests/test_prompt_injection.py`
+— also caught and fixed a real fence-breakout gap, see below), the
+datasource/LLM failure-mode matrix (`tests/test_failure_modes.py`), and
+manual-trigger rate limiting (`tests/test_ratelimit.py`,
+`app/security/ratelimit.py` — new: `/investigate` and `/ask` are now
+capped per caller independent of `RCA_MANUAL_TRIGGER_TOKEN`, see below).
+
+**Also new, opt-in:** auto-remediation — see
+[Auto-remediation](#auto-remediation-opt-in-poc-only) below. Already
+enabled for this POC in `../docker-compose.yml`.
 
 ## Setup
 
@@ -148,7 +165,11 @@ network, not fine if port 8080 ends up reachable from the internet (it's
 published to the host in `docker-compose.yml`). Set
 `RCA_MANUAL_TRIGGER_TOKEN` in `.env` to require an `X-RCA-Trigger-Token`
 header matching it if your EC2 security group exposes 8080 (this also
-gates `/ask` below).
+gates `/ask` below). Independent of that token, both endpoints are also
+rate-limited per caller (`RCA_MANUAL_TRIGGER_RATE_LIMIT`, default 10
+requests per `RCA_MANUAL_TRIGGER_RATE_LIMIT_WINDOW_SECONDS`, default 60s)
+— a 429 means slow down, not a bug; this exists so a caller who does have
+the token can't loop-spam the Anthropic bill or the Slack channel.
 
 ## Ask a question directly (`POST /ask`)
 
@@ -200,53 +221,116 @@ Alertmanager --webhook--> POST /webhook/alertmanager (app/main.py)
                     -> final confidence = min(deterministic, LLM's own)
                                   |
                     app/rca/{summary,report}.py format Slack text/markdown
+                    (app/grafana/discovery.py attaches a relevant
+                    dashboard link, found by matching the alert against
+                    live Grafana panel PromQL, not a hardcoded UID)
                                   |
                     app/slack/client.py posts into the incident's thread
+                                  |
+                    app/investigation/remediation_policy.py: deterministic
+                    check (confidence + matched hypothesis + cooldown,
+                    never LLM-decided) -> if it qualifies,
+                    app/remediation/client.py POSTs to the backend's own
+                    allow-listed /agent-remediation/restart
 ```
 
 Every module maps to a section of `agent-spec.md` — most files carry a
 docstring pointing at the specific section(s) they implement.
 
+## Auto-remediation (opt-in, POC-only)
+
+`app/remediation/client.py` gives this agent one write action beyond
+Slack: restarting the `backend` container, via a POST to the backend's
+own allow-listed `/agent-remediation/restart`
+(`expense-backend-v1.2/src/routes/agentRemediation.js`) — this agent
+never touches the Docker socket to do it itself; `app/docker/
+readonly_client.py`'s mount stays read-only, unchanged.
+
+**Three independent gates**, all must hold, and none of them is the LLM:
+
+1. Both flags are on: `RCA_AUTO_REMEDIATION_ENABLED` (rca-agent) and
+   `ENABLE_AGENT_REMEDIATION` (backend) — already `true` for both in
+   `../docker-compose.yml` for this POC; flip either to `false` to turn
+   it off.
+2. `app/investigation/remediation_policy.py`'s `decide()` — deterministic
+   code, called *after* `generate_rca()` has already produced the final
+   (evidence + LLM, most-conservative-wins) confidence — says yes: the
+   alert is `HighAPIp99Latency`/`HTTP500High` (or their `slo-rules.yml`
+   aliases), the *deterministic* top-ranked hypothesis is specifically
+   "resource exhaustion" or "application-level error" (not MySQL down,
+   not a plain traffic spike — restarting `backend` wouldn't fix either),
+   confidence is at least `RCA_AUTO_REMEDIATION_MIN_CONFIDENCE` (default
+   `High`), and it has no contradicting evidence.
+3. `backend` isn't still within `RCA_AUTO_REMEDIATION_COOLDOWN_SECONDS`
+   (default 900s / 15min) of its last agent-triggered restart — an
+   in-process cooldown so a still-firing alert can't restart-loop the
+   container. Resets if the rca-agent container itself restarts.
+
+The LLM is never given this as a tool and never decides whether it fires
+— same "no tool exists" guarantee as everywhere else in this codebase
+(#70); the decision is 100% deterministic code reading the already-scored
+hypothesis, not LLM-authored text. A restart is a **mitigation, not a
+fix** — it's reported to the incident's Slack thread either way
+(success or failure, `SlackClient.send_remediation_notice`), and the RCA
+above it still documents the actual root cause.
+
+**Real tradeoff, not just a toggle**: making the backend's endpoint able
+to do anything requires giving that container Docker socket access
+(`../docker-compose.yml`'s `backend` service, read-write — unlike every
+other socket mount in this stack, which is `:ro` and GET-only). Control
+of the Docker socket is effectively root on the host machine. That's an
+acceptable, deliberate tradeoff for this local teaching POC; it is not
+something to carry into a real deployment without a lot more thought
+(a narrower remediation-only sidecar, not the app container itself, would
+be the first change).
+
 ## Security model
 
-- **No mutation surface exists**: there is no `execute_shell()`, no
-  arbitrary-SQL executor, no Docker exec/restart/stop call, no GitHub
-  write call, anywhere in this codebase — not gated behind a flag, simply
-  absent. `app/security/permissions.py` documents (and tests) this
-  explicitly.
+- **No mutation surface exists beyond Slack and the one allow-listed
+  remediation action above**: there is no `execute_shell()`, no
+  arbitrary-SQL executor, no generic Docker exec/restart/stop call
+  reachable from this agent's own code, no GitHub write call, anywhere in
+  this codebase — not gated behind a flag, simply absent.
+  `app/security/permissions.py` documents (and tests) this explicitly.
+  The one exception, restarting `backend`, is gated by three independent
+  checks (see "Auto-remediation" above) and goes through the backend's
+  own server-side allow-list, never this agent's Docker access.
 - **MySQL**: `app/mysql/readonly_client.py` can only run a query by a
   fixed key into `SAFE_QUERY_LIBRARY` — there is no method that accepts
   SQL text from a caller, LLM included. The `rca_agent` database account
   itself also can't write anything, so this is defense in depth, not the
   only layer.
-- **Docker**: read-only socket mount (same as `alloy`'s existing mount),
-  and `app/docker/readonly_client.py` only ever calls
-  `list`/`get`/`.attrs` — never `.exec_run()`/`.restart()`/`.stop()`.
+- **Docker**: this agent's own socket mount stays read-only (same as
+  `alloy`'s), and `app/docker/readonly_client.py` only ever calls
+  `list`/`get`/`.attrs` — never `.exec_run()`/`.restart()`/`.stop()`. The
+  container restart described above happens on the *backend* service,
+  through its own HTTP endpoint and its own separate socket access —
+  never through this client or this agent's socket.
 - **The LLM has no tools.** `app/llm/client.py` sends evidence as text and
   parses a JSON response — there is no function-calling loop, so there is
   nothing for a compromised LLM to invoke even in principle (#70). Prompt
   injection from logs/traces/source code is handled by treating that
   content as fenced, explicitly-untrusted data
   (`app/security/sanitization.py`'s `wrap_untrusted`), not by asking the
-  model nicely.
-- **Slack is the only write.** `app/slack/client.py` is the sole class in
-  this codebase with a `POST`/write call other than the two read-only
-  API clients' own GET requests.
+  model nicely. `wrap_untrusted` also neutralizes any literal fence-marker
+  string that shows up *inside* evidence text (e.g. a log line containing
+  a literal `</untrusted-observability-data>`) — otherwise that evidence
+  could forge a fake early close and make attacker text look like it sits
+  outside the fence. Found and fixed via
+  `tests/test_prompt_injection.py` / `tests/test_sanitization.py`'s
+  forged-marker tests.
+- **Only two write-capable clients exist in this codebase**:
+  `app/slack/client.py` and `app/remediation/client.py` — everything else
+  (Prometheus/Loki/Tempo/MySQL/Docker/GitHub/Grafana) is GET-only. The
+  remediation client's one call is a fixed POST body shape
+  (`{"container": "backend"}`) to a fixed URL — never assembled from LLM
+  output or request input.
 - **Secrets** never reach the LLM prompt or a Slack message —
   `app/security/sanitization.py` redacts tokens/passwords/JWTs/cookies/
   emails from evidence before it's used anywhere downstream.
 
 ## What's deliberately out of scope here
 
-- **Remediation.** `expense-backend-v1.2/src/routes/agentRemediation.js`
-  (the allow-listed container-restart endpoint,
-  `ENABLE_AGENT_REMEDIATION`) is a later stage's concern, not this one's
-  — see that file and the backend's own `.env.example`. This agent never
-  calls it.
-- **A full Grafana dashboard/datasource discovery API** — `app/grafana/
-  client.py` generates Explore/dashboard links (useful, real), not a
-  crawler of Grafana's own API.
-- **A broader test suite** (rate limiting, prompt-injection end-to-end,
-  full failure-mode matrix) — `tests/` covers the permission boundary,
-  sanitization, confidence scoring, and dedup; expanding it is natural
-  fast-follow work.
+- **Remediation beyond the one allow-listed `backend` restart** above —
+  no other container, no other action (no scale/redeploy/config change),
+  and no path for the LLM or a request body to name an arbitrary target.

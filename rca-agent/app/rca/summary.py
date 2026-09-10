@@ -39,4 +39,11 @@ def format_summary(result: RCAResult, severity: str, duration_str: str, service:
         lines.append("")
 
     lines.append(f"Investigation: {'Incomplete' if result.insufficient_evidence else 'Complete'}")
+
+    if result.dashboard_url:
+        # Slack-native link syntax here, not [text](url) — this summary is
+        # sent as-is (app/slack/client.py's send_rca_summary), it doesn't
+        # pass through markdown_to_mrkdwn the way the detailed report does.
+        lines.append(f"\n<{result.dashboard_url}|{result.dashboard_description or 'View in Grafana'}>")
+
     return "\n".join(lines)

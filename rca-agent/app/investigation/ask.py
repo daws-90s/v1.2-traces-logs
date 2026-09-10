@@ -127,6 +127,7 @@ def handle_ask(question: str, timeout_seconds: int) -> dict:
         "impact": result.impact,
         "evidence": result.evidence[:8],
         "recommended_remediation": result.recommended_remediation,
+        "dashboard_url": result.dashboard_url,
         "elapsed_seconds": elapsed,
         "note": "Full detailed RCA also posted to Slack." if incident.slack_thread_ts else "Slack not configured — this response is the only copy of the RCA.",
     }

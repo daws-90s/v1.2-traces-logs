@@ -13,7 +13,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -23,6 +23,7 @@ from app.config import settings
 from app.investigation.ask import handle_ask
 from app.investigation.orchestrator import handle_webhook_alert
 from app.playbooks.registry import get_playbook
+from app.security.ratelimit import RateLimitExceeded, SlidingWindowRateLimiter
 from app.state import store
 
 
@@ -48,6 +49,26 @@ logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.I
 logger = logging.getLogger("rca_agent")
 
 app = FastAPI(title="Observability RCA Agent", version="1.0.0")
+
+# Shared across /investigate and /ask (not one limiter per route) — a
+# caller hammering both endpoints alternately should still be capped by
+# one combined budget, not get 2x the allowance by switching routes.
+_manual_trigger_limiter = SlidingWindowRateLimiter(
+    max_requests=settings.manual_trigger_rate_limit,
+    window_seconds=settings.manual_trigger_rate_limit_window_seconds,
+)
+
+
+def _enforce_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    try:
+        _manual_trigger_limiter.check(key)
+    except RateLimitExceeded as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=f"rate limit exceeded ({settings.manual_trigger_rate_limit} requests per "
+            f"{settings.manual_trigger_rate_limit_window_seconds}s) — retry after {exc.retry_after_seconds:.0f}s",
+        )
 
 
 @app.on_event("startup")
@@ -116,7 +137,7 @@ class ManualInvestigationRequest(BaseModel):
 
 
 @app.post("/investigate")
-def manual_investigate(req: ManualInvestigationRequest, x_rca_trigger_token: str | None = Header(default=None)):
+def manual_investigate(req: ManualInvestigationRequest, request: Request, x_rca_trigger_token: str | None = Header(default=None)):
     """Runs the investigation pipeline exactly as the real webhook would,
     without waiting for Prometheus to actually breach a threshold — useful
     for demoing a specific playbook (MySQLDown, HighAPIp99Latency with a
@@ -124,6 +145,7 @@ def manual_investigate(req: ManualInvestigationRequest, x_rca_trigger_token: str
     for curl examples per playbook."""
     if settings.manual_trigger_token and x_rca_trigger_token != settings.manual_trigger_token:
         raise HTTPException(status_code=403, detail="missing or invalid X-RCA-Trigger-Token")
+    _enforce_rate_limit(request)
     if req.status not in ("firing", "resolved"):
         raise HTTPException(status_code=400, detail='status must be "firing" or "resolved"')
     if req.status == "resolved" and not req.fingerprint:
@@ -169,7 +191,7 @@ class AskRequest(BaseModel):
 
 
 @app.post("/ask")
-def ask(req: AskRequest, x_rca_trigger_token: str | None = Header(default=None)):
+def ask(req: AskRequest, request: Request, x_rca_trigger_token: str | None = Header(default=None)):
     """Free-text investigation, e.g. {"question": "investigate a recent
     high latency request and tell me the reason"}. Unlike /investigate,
     this blocks until the investigation finishes (or times out) and
@@ -178,6 +200,7 @@ def ask(req: AskRequest, x_rca_trigger_token: str | None = Header(default=None))
     text gets classified into a playbook."""
     if settings.manual_trigger_token and x_rca_trigger_token != settings.manual_trigger_token:
         raise HTTPException(status_code=403, detail="missing or invalid X-RCA-Trigger-Token")
+    _enforce_rate_limit(request)
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="question must not be empty")
 

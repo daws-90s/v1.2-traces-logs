@@ -39,10 +39,27 @@ services:
       # ENABLE_DEBUG_ROUTES: no app code changed to add this — routes/debug.js
       # and middleware/debugInjections.js have been sitting in this codebase,
       # unchanged, since v1.1. This is the only line that turns them on.
-      # ENABLE_AGENT_REMEDIATION deliberately stays unset: /agent-remediation
-      # (the allow-listed container-restart endpoint) is a later stage's
-      # concern, not this one's.
+      #
+      # ENABLE_AGENT_REMEDIATION: mounts /agent-remediation/restart
+      # (routes/agentRemediation.js), the RCA agent's only write action
+      # beyond Slack (rca-agent/app/remediation/client.py,
+      # RCA_AUTO_REMEDIATION_ENABLED below). The route enforces its own
+      # ALLOWED_CONTAINERS=['backend'] allow-list server-side regardless
+      # of what the agent sends — but making it callable at all requires
+      # this container to have Docker socket access (the volumes: mount
+      # below), which is a real privilege escalation on the host (control
+      # of the socket is effectively root on the machine), not something
+      # to carry into a non-POC deployment without much more thought.
       ENABLE_DEBUG_ROUTES: "true"
+      ENABLE_AGENT_REMEDIATION: "true"
+    volumes:
+      # Read-write, unlike every other socket mount in this stack
+      # (alloy/rca-agent both mount :ro and only ever call GET) — this is
+      # the one place an actual POST (container restart) needs to reach
+      # the daemon. Scoped by ALLOWED_CONTAINERS in agentRemediation.js,
+      # not by the mount flag (a :ro bind mount of the socket *file*
+      # doesn't restrict what you can send once connected to it).
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       mysql:
         condition: service_healthy
@@ -315,6 +332,14 @@ services:
       MYSQL_HOST: mysql
       MYSQL_PORT: 3306
       MYSQL_DATABASE: expense_tracker
+      BACKEND_URL: http://backend:4000
+      # Both this AND backend's own ENABLE_AGENT_REMEDIATION above must be
+      # "true" for a restart to actually happen — see
+      # app/investigation/remediation_policy.py for the (deterministic,
+      # confidence-gated, cooldown-limited) decision of when. Set to
+      # "false" here to turn auto-remediation off without touching the
+      # backend service at all.
+      RCA_AUTO_REMEDIATION_ENABLED: "true"
     volumes:
       # Read-only, same as alloy above — this client only ever lists/
       # inspects containers (app/docker/readonly_client.py), never
